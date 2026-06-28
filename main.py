@@ -22,8 +22,10 @@ import json
 import os
 import platform
 import secrets as _secrets
+import shutil
 import socket
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
-from core.config import settings, get_config_snapshot, update_env_file
+from core.config import settings, get_config_snapshot, update_env_file, detect_safe_path
 from core.security import verify_api_key, decrypt_payload
 from core.command_engine import CommandEngine
 
@@ -61,6 +63,44 @@ app.add_middleware(
 )
 
 # ===================================================================
+# Helper — safe atomic file replace on Windows
+# ===================================================================
+
+def _safe_atomic_replace(src: Path, dst: Path, retries: int = 3, delay: float = 0.5) -> None:
+    """
+    Atomically replace ``dst`` with ``src``.
+
+    On Windows, ``os.replace`` fails with PermissionError if the target
+    file is locked (e.g. open in Excel).  This helper retries several
+    times, then falls back to a content-copy via ``shutil.copy2``.
+    """
+    if not src.is_file():
+        raise FileNotFoundError(f"Source file not found: {src}")
+
+    last_err: Exception | None = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            os.replace(src, dst)
+            return  # success
+        except PermissionError as exc:
+            last_err = exc
+            if attempt < retries:
+                time.sleep(delay)
+            continue
+
+    # All retries exhausted — try copy-then-delete as last resort
+    try:
+        shutil.copy2(src, dst)
+        src.unlink(missing_ok=True)
+        return
+    except Exception as exc:
+        last_err = exc
+
+    raise OSError(f"Cannot replace {dst}: {last_err}") from last_err
+
+
+# ===================================================================
 # Pydantic schemas
 # ===================================================================
 
@@ -71,12 +111,20 @@ class UpdatePayload(BaseModel):
 
     The frontend sends an encrypted JSON blob.  The *encrypted* field
     carries the Fernet token (Base64-encoded).
+
+    Optional sheet_name tells the bridge which Excel sheet to write to.
+    If omitted, the configured default sheet is used.  If the sheet does
+    not exist it will be created automatically.
     """
 
     encrypted: str = Field(
         ...,
         description="Fernet-encrypted, Base64-encoded JSON payload.",
         min_length=1,
+    )
+    sheet_name: str = Field(
+        default="",
+        description="Target Excel sheet name. Auto-created if missing.",
     )
 
 
@@ -148,9 +196,47 @@ async def require_auth(request: Request) -> None:
     verify_api_key(request)
 
 
+async def require_main(request: Request) -> None:
+    """FastAPI dependency that blocks writes if bridge is not main."""
+    if not settings.BRIDGE_IS_MAIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This bridge is not the main bridge for its location. Only the main bridge can save data to Excel.",
+        )
+
+
 # ===================================================================
-# Routes
+# Approval callback (called by central app)
 # ===================================================================
+
+class ApprovalPayload(BaseModel):
+    """Payload sent by the central app when approving/rejecting a bridge."""
+    is_approved: bool = False
+    is_main: bool = False
+    location: str = ""
+    office: str = ""
+
+
+@app.post("/api/approval")
+async def approval_callback(payload: ApprovalPayload, request: Request) -> dict:
+    """
+    Called by the central RMMS app when admin approves/rejects a bridge.
+    Updates the local .env with approval status and main-bridge flag.
+    """
+    verify_api_key(request)
+    updates = {
+        "BRIDGE_IS_APPROVED": str(payload.is_approved).lower(),
+        "BRIDGE_IS_MAIN": str(payload.is_main).lower(),
+        "BRIDGE_LOCATION": payload.location,
+        "BRIDGE_OFFICE": payload.office,
+    }
+    results = update_env_file(updates)
+    # Reload settings so runtime sees the change
+    settings.BRIDGE_IS_APPROVED = payload.is_approved
+    settings.BRIDGE_IS_MAIN = payload.is_main
+    settings.BRIDGE_LOCATION = payload.location
+    settings.BRIDGE_OFFICE = payload.office
+    return {"status": "ok", "updates": results}
 
 
 @app.get("/health")
@@ -181,6 +267,13 @@ async def root_page():
         api_key=settings.API_KEY,
         fernet_key=settings.FERNET_KEY,
         bridge_id=settings.BRIDGE_ID,
+        status_badge=(
+            '<span style="color:#16a34a;">✅ Approved (Main)</span>' if settings.BRIDGE_IS_MAIN
+            else '<span style="color:#16a34a;">✅ Approved</span>' if settings.BRIDGE_IS_APPROVED
+            else '<span style="color:#92400e;">⏳ Pending Approval</span>'
+        ),
+        location_display=settings.BRIDGE_LOCATION or "<em style='color:#94a3b8;'>Not set</em>",
+        loc_value=settings.BRIDGE_LOCATION or "",
     ))
 
 
@@ -224,13 +317,18 @@ async def machine_info() -> dict[str, Any]:
     response_model=DataResponse,
     dependencies=[Depends(require_auth)],
 )
-async def get_data() -> DataResponse:
+async def get_data(sheet: str = "") -> DataResponse:
     """
     Read the configured Excel file and return all rows as JSON.
 
-    Returns 404 if the file does not exist.
+    Query params:
+      sheet  — Optional sheet name. If provided, reads from that sheet.
+               Otherwise uses the configured default sheet.
+
+    Returns 404 if the file or sheet does not exist.
     """
     path: Path = settings.EXCEL_FILE_PATH
+    sheet_name = sheet.strip() if sheet else settings.EXCEL_SHEET_NAME
 
     if not path.is_file():
         raise HTTPException(
@@ -239,14 +337,21 @@ async def get_data() -> DataResponse:
         )
 
     try:
-        df: pd.DataFrame = pd.read_excel(
-            path,
-            sheet_name=settings.EXCEL_SHEET_NAME,
-        )
+        # Check if the sheet exists
+        xl = pd.ExcelFile(path)
+        if sheet_name not in xl.sheet_names:
+            # Sheet doesn't exist — return empty dataset (don't error)
+            return DataResponse(
+                sheet_name=sheet_name,
+                row_count=0,
+                columns=["Date & Time", "Barcode", "Action"],
+                data=[],
+            )
+        df: pd.DataFrame = pd.read_excel(path, sheet_name=sheet_name)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Sheet '{settings.EXCEL_SHEET_NAME}' not found in {path}: {exc!s}",
+            detail=f"Sheet '{sheet_name}' not found in {path}: {exc!s}",
         )
     except Exception as exc:
         raise HTTPException(
@@ -258,7 +363,7 @@ async def get_data() -> DataResponse:
     df = df.where(pd.notna(df), None)
 
     return DataResponse(
-        sheet_name=settings.EXCEL_SHEET_NAME,
+        sheet_name=sheet_name,
         row_count=len(df),
         columns=list(df.columns),
         data=df.to_dict(orient="records"),
@@ -268,7 +373,7 @@ async def get_data() -> DataResponse:
 @app.post(
     "/update",
     response_model=UpdateResponse,
-    dependencies=[Depends(require_auth)],
+    dependencies=[Depends(require_auth), Depends(require_main)],
 )
 async def update_data(payload: UpdatePayload) -> UpdateResponse:
     """
@@ -299,32 +404,75 @@ async def update_data(payload: UpdatePayload) -> UpdateResponse:
         )
 
     if not records:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot write an empty dataset.",
-        )
+        # Empty dataset = clear the sheet (keep the sheet, remove all rows)
+        try:
+            path: Path = settings.EXCEL_FILE_PATH
+            target_sheet = payload.sheet_name.strip() if payload.sheet_name else settings.EXCEL_SHEET_NAME
+
+            if path.is_file():
+                import openpyxl
+                tmp_path = path.with_suffix(".tmp.xlsx")
+                wb = openpyxl.load_workbook(path)
+                if target_sheet in wb.sheetnames:
+                    ws = wb[target_sheet]
+                    # Delete all rows except header
+                    ws.delete_rows(1, ws.max_row)
+                wb.save(tmp_path)
+                wb.close()
+                _safe_atomic_replace(tmp_path, path)
+            return UpdateResponse(
+                message=f"Sheet '{target_sheet}' cleared successfully.",
+                rows_written=0,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to clear sheet: {exc!s}",
+            )
 
     # 3. Convert to DataFrame and write
     try:
         df: pd.DataFrame = pd.DataFrame(records)
         path: Path = settings.EXCEL_FILE_PATH
+        target_sheet = payload.sheet_name.strip() if payload.sheet_name else settings.EXCEL_SHEET_NAME
 
         # Ensure parent directory exists
         path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write to a temporary file first, then atomically replace.
-        # This avoids "Permission denied" errors on Windows when openpyxl
-        # still holds a file handle from a previous read_excel.
-        import tempfile
-        import os as _os
-
         tmp_path = path.with_suffix(".tmp.xlsx")
-        df.to_excel(
-            tmp_path,
-            sheet_name=settings.EXCEL_SHEET_NAME,
-            index=False,
-        )
-        _os.replace(tmp_path, path)
+
+        # If the file already exists, we need to preserve other sheets.
+        # Read existing workbook, update/add the target sheet, then write.
+        if path.is_file():
+            import openpyxl
+            try:
+                wb = openpyxl.load_workbook(path)
+            except Exception:
+                wb = openpyxl.Workbook()
+            # Remove target sheet if it exists, then recreate it
+            if target_sheet in wb.sheetnames:
+                del wb[target_sheet]
+            # If default sheet "Sheet" exists and we're writing to a different sheet, remove it
+            if "Sheet" in wb.sheetnames and target_sheet != "Sheet" and len(wb.sheetnames) == 1:
+                del wb["Sheet"]
+            ws = wb.create_sheet(title=target_sheet)
+            # Write headers
+            for col_idx, col_name in enumerate(df.columns, 1):
+                ws.cell(row=1, column=col_idx, value=col_name)
+            # Write data rows
+            for row_idx, row in enumerate(df.itertuples(index=False), 2):
+                for col_idx, value in enumerate(row, 1):
+                    ws.cell(row=row_idx, column=col_idx, value=value if pd.notna(value) else None)
+            wb.save(tmp_path)
+            wb.close()
+        else:
+            df.to_excel(
+                tmp_path,
+                sheet_name=target_sheet,
+                index=False,
+            )
+        _safe_atomic_replace(tmp_path, path)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -341,11 +489,14 @@ async def update_data(payload: UpdatePayload) -> UpdateResponse:
     "/command",
     dependencies=[Depends(require_auth)],
 )
-async def execute_command(payload: CommandRequest):
+async def execute_command(payload: CommandRequest, request: Request):
     """
     Execute a command against the Excel database.
 
     Supported commands: ADD, RMV, REPL, FIND, SHOW, HELP
+
+    Read-only commands (HELP, SHOW, GET, RANGE, LASTROW, LASTCOL, COLS) work
+    on any bridge. Write commands require the bridge to be the main bridge.
 
     Examples:
       ADD  {"data": "new value"}
@@ -359,6 +510,14 @@ async def execute_command(payload: CommandRequest):
         excel_path=settings.EXCEL_FILE_PATH,
         sheet_name=settings.EXCEL_SHEET_NAME,
     )
+
+    # Block write commands on non-main bridges
+    if not CommandEngine.is_read_only(payload.command) and not settings.BRIDGE_IS_MAIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This bridge is not the main bridge for its location. Only the main bridge can save data to Excel.",
+        )
+
     result = engine.execute(payload.command)
     return result.to_dict()
 
@@ -390,11 +549,41 @@ async def update_config(payload: ConfigUpdatePayload) -> ConfigUpdateResult:
     """
     Update configuration values and persist them to the .env file.
 
+    If the Excel file path is changed, the existing data file is
+    **automatically moved** to the new location (preserving all sheets).
+
     The server must be **restarted** for server-level settings
     (HOST, PORT, CORS) to take effect.  API_KEY and FERNET_KEY take
     effect on the next request.
     """
+    old_excel_path = settings.EXCEL_FILE_PATH
+    new_excel_path_raw = payload.updates.get("EXCEL_FILE_PATH")
+
     results = update_env_file(payload.updates)
+
+    # --- Auto-move Excel file if path changed ---
+    if new_excel_path_raw:
+        new_excel_path = Path(str(new_excel_path_raw).strip()).resolve()
+
+        # Only move if the path actually changed and the old file exists
+        if new_excel_path != old_excel_path.resolve() and old_excel_path.is_file():
+            try:
+                # Ensure the target directory exists
+                new_excel_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Copy the old file to the new location
+                shutil.copy2(str(old_excel_path), str(new_excel_path))
+                results["EXCEL_FILE_MOVED"] = (
+                    f"Data copied from '{old_excel_path}' → '{new_excel_path}'."
+                    f" You may delete the old file manually if desired."
+                )
+            except Exception as exc:
+                results["EXCEL_FILE_MOVED"] = (
+                    f"WARNING: Could not copy data to new location: {exc}. "
+                    f"Old file still at '{old_excel_path}'. "
+                    f"Please manually copy it to '{new_excel_path}'."
+                )
+
     return ConfigUpdateResult(
         status="ok",
         results=results,
@@ -418,6 +607,18 @@ async def generate_api_key() -> dict[str, str]:
 async def generate_fernet_key() -> dict[str, str]:
     """Generate a fresh Fernet encryption key."""
     return {"fernet_key": Fernet.generate_key().decode("utf-8")}
+
+
+@app.get(
+    "/config/safe-path",
+    dependencies=[Depends(require_auth)],
+)
+async def get_safe_path() -> dict[str, str]:
+    """
+    Auto-detect the best non-system partition for Excel data storage.
+    Returns the recommended path and a human-readable reason.
+    """
+    return detect_safe_path()
 
 
 # ===================================================================
@@ -587,6 +788,14 @@ _ROOT_HTML = """<!DOCTYPE html>
                 <div class="label">Bridge ID</div>
                 <div class="value" style="font-family:monospace; font-size:0.8rem; word-break:break-all;">{bridge_id}</div>
             </div>
+            <div class="info-item">
+                <div class="label">Status</div>
+                <div class="value">{status_badge}</div>
+            </div>
+            <div class="info-item">
+                <div class="label">Location</div>
+                <div class="value">{location_display}</div>
+            </div>
         </div>
     </div>
 
@@ -607,8 +816,16 @@ _ROOT_HTML = """<!DOCTYPE html>
         <input type="text" id="bridgeLoc"
                list="locDatalist"
                placeholder="e.g. Colombo, Sri Lanka"
-               value="" required>
+               value="{loc_value}" required>
         <datalist id="locDatalist"></datalist>
+
+        <label for="bridgeOffice">Office <span style="color:var(--danger);">*</span></label>
+        <input type="text" id="bridgeOffice"
+               placeholder="e.g. Colombo Main, Nugegoda Branch"
+               value="">
+        <p style="color:var(--text-secondary); font-size:0.75rem; margin-top:-0.25rem; margin-bottom:0.75rem;">
+            Office within the selected location (e.g. branch name, division, sub-area).
+        </p>
 
         <label for="centralUrl">Central App URL <span style="color:var(--danger);">*</span></label>
         <input type="url" id="centralUrl"
@@ -738,6 +955,7 @@ async function sendRequest() {{
     if (submitting) return;
     var bridgeName = document.getElementById('bridgeName').value.trim();
     var bridgeLoc = document.getElementById('bridgeLoc').value.trim();
+    var bridgeOffice = document.getElementById('bridgeOffice').value.trim();
     var centralUrl = document.getElementById('centralUrl').value.trim();
     if (!bridgeName) {{
         showStatus('Please enter a bridge name.', 'err');
@@ -745,6 +963,10 @@ async function sendRequest() {{
     }}
     if (!bridgeLoc) {{
         showStatus('Please enter the bridge location.', 'err');
+        return;
+    }}
+    if (!bridgeOffice) {{
+        showStatus('Please enter the office name.', 'err');
         return;
     }}
     if (!centralUrl) {{
@@ -762,6 +984,7 @@ async function sendRequest() {{
         id: "{bridge_id}",
         name: bridgeName,
         location: bridgeLoc,
+        office: bridgeOffice,
         url: "{bridge_url}",
         api_key: "{api_key}",
         fernet_key: "{fernet_key}",
@@ -776,7 +999,10 @@ async function sendRequest() {{
         }});
         var data = await resp.json();
         if (resp.ok) {{
-            showStatus('✅ ' + (data.message || 'Request submitted! Waiting for admin approval.'), 'ok');
+            var msg = '✅ ' + (data.message || 'Request submitted! Waiting for admin approval.');
+            if (data.warning) msg += '\\n⚠️ ' + data.warning;
+            if (data.main_status) msg += '\\n⭐ ' + data.main_status;
+            showStatus(msg, 'ok');
             btn.innerHTML = '✅ Request Sent';
             btn.className = 'btn btn-success';
         }} else {{
@@ -1061,7 +1287,14 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       <!-- Excel File Path -->
       <div class="form-group">
         <label for="cfg-excel-path">Excel File Path</label>
-        <input type="text" id="cfg-excel-path" placeholder="data.xlsx">
+        <div class="input-row">
+          <input type="text" id="cfg-excel-path" placeholder="data.xlsx">
+          <button type="button" class="btn btn-outline btn-sm"
+                  onclick="detectSafePath()" title="Auto-detect safe partition for data">&#128194; Safe Path</button>
+        </div>
+        <p style="font-size:.7rem;color:var(--sub);margin-top:4px;" id="excel-path-hint">
+          Store data on a non-system drive to keep it safe if Windows is reformatted.
+        </p>
       </div>
 
       <!-- Sheet Name -->
@@ -1210,6 +1443,23 @@ async function generateAndSet(type) {
 }
 
 // ------------------------------------------------------------------
+// Detect safe Excel path
+// ------------------------------------------------------------------
+async function detectSafePath() {
+  try {
+    const res = await fetch('/config/safe-path', { headers: headers() });
+    if (!res.ok) throw new Error((await res.json()).detail || 'Detection failed');
+    const data = await res.json();
+    document.getElementById('cfg-excel-path').value = data.path;
+    document.getElementById('excel-path-hint').textContent =
+      '✅ ' + data.reason;
+    showToast('Safe path detected! Click Save to apply.', 'success');
+  } catch (e) {
+    showToast('Detection failed: ' + e.message, 'error');
+  }
+}
+
+// ------------------------------------------------------------------
 // Save config
 // ------------------------------------------------------------------
 async function saveConfig() {
@@ -1245,7 +1495,12 @@ async function saveConfig() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Save failed');
-    showToast('Configuration saved! Restart the server for all changes to take effect.', 'success');
+
+    let msg = 'Configuration saved! Restart the server for all changes to take effect.';
+    if (data.results && data.results.EXCEL_FILE_MOVED) {
+      msg = '✅ ' + data.results.EXCEL_FILE_MOVED.replace(/\\n/g, ' ');
+    }
+    showToast(msg, 'success');
     // Refresh the displayed config
     const cfgRes = await fetch('/config', { headers: headers() });
     if (cfgRes.ok) {
@@ -1307,7 +1562,7 @@ async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSON
 # Auto-registration helper
 # ---------------------------------------------------------------------------
 
-def _auto_register(central_url: str, bridge_name: str = "", location: str = "", is_main: bool = False) -> bool:
+def _auto_register(central_url: str, bridge_name: str = "", location: str = "", office: str = "", is_main: bool = False) -> bool:
     """
     Attempt to register this bridge with the central web app.
     Returns True on success, False on failure.
@@ -1331,6 +1586,8 @@ def _auto_register(central_url: str, bridge_name: str = "", location: str = "", 
         location = os.getenv("BRIDGE_LOCATION", "")
     if not location:
         location = bridge_name
+    if not office:
+        office = os.getenv("BRIDGE_OFFICE", "")
 
     # Use REGISTRATION_KEY from env if set
     reg_key = os.getenv("REGISTRATION_KEY", "register-me")
@@ -1342,6 +1599,7 @@ def _auto_register(central_url: str, bridge_name: str = "", location: str = "", 
         "id": bridge_id,
         "name": bridge_name,
         "location": location,
+        "office": office,
         "url": f"http://{local_ip}:{settings.PORT}",
         "api_key": settings.API_KEY,
         "fernet_key": settings.FERNET_KEY,
@@ -1401,6 +1659,12 @@ if __name__ == "__main__":
         help="Human-readable location label (e.g. 'Colombo, Sri Lanka'). Also read from BRIDGE_LOCATION env var.",
     )
     parser.add_argument(
+        "--office",
+        metavar="OFFICE",
+        default=os.getenv("BRIDGE_OFFICE", ""),
+        help="Office name within the location (e.g. 'Head Office'). Also read from BRIDGE_OFFICE env var.",
+    )
+    parser.add_argument(
         "--main",
         action="store_true",
         default=False,
@@ -1425,6 +1689,7 @@ if __name__ == "__main__":
     print(f"  Health     : http://{local_ip}:{settings.PORT}/health")
     print(f"  Info       : http://{local_ip}:{settings.PORT}/info")
     print(f"  Admin      : http://{local_ip}:{settings.PORT}/admin")
+    print(f"  Data File  : {settings.EXCEL_FILE_PATH}")
     print("-" * 60)
     print("  💡 To make this bridge reachable from the internet:")
     print("     1. Port forwarding: forward port 8000 on your router")
@@ -1434,11 +1699,11 @@ if __name__ == "__main__":
 
     # --- Auto-register if requested ---
     if args.register:
-        _auto_register(args.register, args.name, args.location, args.main)
+        _auto_register(args.register, args.name, args.location, args.office, args.main)
         print()
 
     uvicorn.run(
-        "main:app",
+        app,
         host=settings.HOST,
         port=settings.PORT,
         reload=False,  # Set to True for development only

@@ -220,6 +220,21 @@ Prefix with / is optional. All commands case-insensitive.
     # Public API
     # ------------------------------------------------------------------
 
+    # Read-only commands that don't modify the Excel file
+    _READ_ONLY_COMMANDS = {"HELP", "SHOW", "GET", "RANGE", "LASTROW", "LASTCOL", "COLS"}
+
+    @staticmethod
+    def is_read_only(command_text: str) -> bool:
+        """Check if a command is read-only (doesn't modify the Excel file)."""
+        text = command_text.strip()
+        if text.startswith("/"):
+            text = text[1:].strip()
+        if not text:
+            return True  # empty command is harmless
+        # Extract the command keyword (first word)
+        keyword = text.split()[0].upper() if text.split() else ""
+        return keyword in CommandEngine._READ_ONLY_COMMANDS
+
     def execute(self, command_text: str) -> CommandResult:
         """Parse and execute a single command string."""
         text = command_text.strip()
