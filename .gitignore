@@ -1,0 +1,10 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+*.xlsx
+.venv/
+venv/
+dist/
+.vscode/
+.playwright-mcp/
