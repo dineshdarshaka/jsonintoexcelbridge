@@ -603,11 +603,11 @@ _ROOT_HTML = """<!DOCTYPE html>
                placeholder="e.g. Colombo Office"
                value="{hostname}">
 
-        <label for="bridgeLoc">Location (optional)</label>
+        <label for="bridgeLoc">Location <span style="color:var(--danger);">*</span></label>
         <input type="text" id="bridgeLoc"
                list="locDatalist"
                placeholder="e.g. Colombo, Sri Lanka"
-               value="">
+               value="" required>
         <datalist id="locDatalist"></datalist>
 
         <label for="centralUrl">Central App URL <span style="color:var(--danger);">*</span></label>
@@ -743,6 +743,10 @@ async function sendRequest() {{
         showStatus('Please enter a bridge name.', 'err');
         return;
     }}
+    if (!bridgeLoc) {{
+        showStatus('Please enter the bridge location.', 'err');
+        return;
+    }}
     if (!centralUrl) {{
         showStatus('Please enter the Central App URL.', 'err');
         return;
@@ -757,7 +761,7 @@ async function sendRequest() {{
     var body = {{
         id: "{bridge_id}",
         name: bridgeName,
-        location: bridgeLoc || bridgeName,
+        location: bridgeLoc,
         url: "{bridge_url}",
         api_key: "{api_key}",
         fernet_key: "{fernet_key}",
