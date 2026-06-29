@@ -34,32 +34,32 @@ ENV_PATH = BASE_DIR / ".env"
 
 
 # ---------------------------------------------------------------------------
-# Default Excel file path — safe data partition detection
+# Default data root — safe data partition detection
 # ---------------------------------------------------------------------------
-def _detect_safe_data_partition() -> Path | None:
+def _safe_folder_name(name: str) -> str:
+    """Sanitize a name for use as a folder/file name."""
+    return "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", ".")).strip()
+
+
+def _detect_safe_data_root() -> Path | None:
     """
     On Windows, find a non-system partition with > 100 GB total space
-    to use as the default storage location for the Excel data file.
+    to use as the default storage location for bridge data.
 
     The data stays safe even if Windows is reformatted (system drive wiped).
 
-    Returns a Path to the recommended Excel file, or None if no suitable
-    partition is found.
+    Returns a Path to the recommended data root directory, or None if no
+    suitable partition is found.
     """
     if sys.platform != "win32":
         return None
 
-    # Get the system drive letter
     system_drive = os.environ.get("SystemDrive", "C:").rstrip(":\\").upper()
-
-    # Read the bridge location from env (may have been set via approval callback)
-    bridge_location = os.getenv("BRIDGE_LOCATION", "").strip()
 
     try:
         import ctypes
         import string
 
-        # Get all logical drives
         drives = []
         bitmask = ctypes.windll.kernel32.GetLogicalDrives()
         for letter in string.ascii_uppercase:
@@ -67,7 +67,6 @@ def _detect_safe_data_partition() -> Path | None:
                 drives.append(f"{letter}:\\")
             bitmask >>= 1
 
-        # Check each drive — prefer non-system, fixed, > 100 GB
         for drive in drives:
             drive_letter = drive[0].upper()
             if drive_letter == system_drive:
@@ -85,16 +84,9 @@ def _detect_safe_data_partition() -> Path | None:
                 )
                 total_gb = total_bytes.value / (1024 ** 3)
                 if total_gb >= 100:
-                    # Found a safe partition
                     safe_dir = Path(drive) / "important files(dont delete)" / "app data"
                     safe_dir.mkdir(parents=True, exist_ok=True)
-
-                    if bridge_location:
-                        filename = f"{bridge_location}.xlsx"
-                    else:
-                        filename = "data.xlsx"
-
-                    return safe_dir / filename
+                    return safe_dir
             except Exception:
                 continue
     except Exception:
@@ -103,31 +95,34 @@ def _detect_safe_data_partition() -> Path | None:
     return None
 
 
-def _default_excel_path() -> str:
+def _default_data_root() -> str:
     """
-    Compute the default Excel file path.
+    Compute the default data root directory.
 
     Priority:
       1. If a safe non-system partition (>100 GB) exists → use it
-         at  D:/important files(dont delete)/app data/{location}.xlsx
-      2. Otherwise fall back to BASE_DIR / data.xlsx
+         at  D:/important files(dont delete)/app data/
+      2. Otherwise fall back to BASE_DIR / data/
+
+    Each location gets a subfolder, each office gets a workbook:
+      {DATA_ROOT}/{location}/{office}.xlsx
     """
-    safe = _detect_safe_data_partition()
+    safe = _detect_safe_data_root()
     if safe is not None:
         return str(safe)
-    return str(BASE_DIR / "data.xlsx")
+    return str(BASE_DIR / "data")
 
 
 if not ENV_PATH.is_file():
     import secrets as _secrets
     from cryptography.fernet import Fernet
 
-    _excel_path = _default_excel_path()
+    _data_root = _default_data_root()
     _lines = [
         f"API_KEY={_secrets.token_hex(32)}",
         f"FERNET_KEY={Fernet.generate_key().decode()}",
         "ALLOWED_ORIGINS=http://localhost:3000",
-        f"EXCEL_FILE_PATH={_excel_path}",
+        f"DATA_ROOT={_data_root}",
         "EXCEL_SHEET_NAME=Sheet1",
         "HOST=127.0.0.1",
         "PORT=8000",
@@ -135,9 +130,9 @@ if not ENV_PATH.is_file():
     with open(str(ENV_PATH), "w", encoding="utf-8") as _f:
         _f.write("\n".join(_lines) + "\n")
     print("✅ Auto-generated .env with secrets.")
-    _excel_info = _excel_path
+    _data_root_info = _data_root
 else:
-    _excel_info = os.getenv("EXCEL_FILE_PATH", "data.xlsx")
+    _data_root_info = os.getenv("DATA_ROOT", os.getenv("EXCEL_DIR", str(BASE_DIR / "data")))
 
 load_dotenv(ENV_PATH)
 
@@ -189,11 +184,93 @@ class Settings:
     ]
 
     # -- File paths ---------------------------------------------------------
-    EXCEL_FILE_PATH: Path = Path(
-        os.getenv("EXCEL_FILE_PATH", str(BASE_DIR / "data.xlsx"))
+    # Root directory where all bridge data is stored.
+    # Folder structure: {DATA_ROOT}/{location}/{office}.xlsx
+    # Each .xlsx workbook contains one sheet per section.
+    _raw_data_root = Path(
+        os.getenv("DATA_ROOT", os.getenv("EXCEL_DIR", os.getenv("EXCEL_FILE_PATH", str(BASE_DIR / "data"))))
     ).resolve()
+    # If the resolved path is a file (e.g., legacy EXCEL_FILE_PATH pointing to
+    # a single .xlsx), use its parent directory as the data root instead.
+    if _raw_data_root.is_file():
+        DATA_ROOT: Path = _raw_data_root.parent
+    else:
+        DATA_ROOT: Path = _raw_data_root
 
     EXCEL_SHEET_NAME: str = os.getenv("EXCEL_SHEET_NAME", "Sheet1")
+
+    @staticmethod
+    def get_office_excel_path(office_name: str, location: str = "") -> Path:
+        """Return the Excel file path for a given office and location.
+
+        Folder structure: {DATA_ROOT}/{location}/{office}.xlsx
+
+        If location is empty, uses the bridge's configured BRIDGE_LOCATION.
+        Falls back to placing the file directly in DATA_ROOT if no location
+        is available.
+        """
+        safe_office = _safe_folder_name(office_name)
+        if not safe_office:
+            safe_office = "default"
+
+        loc = location.strip() if location else Settings.BRIDGE_LOCATION.strip()
+        if loc:
+            safe_loc = _safe_folder_name(loc)
+            return Settings.DATA_ROOT / safe_loc / f"{safe_office}.xlsx"
+        else:
+            return Settings.DATA_ROOT / f"{safe_office}.xlsx"
+
+    @staticmethod
+    def get_location_dir(location: str = "") -> Path:
+        """Return the directory for a given location's data files."""
+        loc = location.strip() if location else Settings.BRIDGE_LOCATION.strip()
+        if loc:
+            safe_loc = _safe_folder_name(loc)
+            return Settings.DATA_ROOT / safe_loc
+        return Settings.DATA_ROOT
+
+    @staticmethod
+    def link_data_root(new_root: str) -> dict:
+        """
+        Link the bridge to an existing data folder (e.g., from a backup).
+        Updates DATA_ROOT in .env and returns status info.
+
+        This is used when installing a bridge on a new PC to restore
+        data from a previous installation.
+        """
+        new_path = Path(new_root).resolve()
+        if not new_path.exists():
+            return {"status": "error", "message": f"Path does not exist: {new_path}"}
+        if not new_path.is_dir():
+            return {"status": "error", "message": f"Path is not a directory: {new_path}"}
+
+        old_root = str(Settings.DATA_ROOT)
+        set_key(str(ENV_PATH), "DATA_ROOT", str(new_path), quote_mode="auto")
+        _reload_env()
+        # Update the class-level setting
+        Settings.DATA_ROOT = new_path
+
+        # Log the change
+        log_path_change(old_root, str(new_path), "link")
+
+        # Count location folders and office workbooks in the new root
+        loc_count = 0
+        office_count = 0
+        try:
+            for item in new_path.iterdir():
+                if item.is_dir():
+                    loc_count += 1
+                    office_count += len(list(item.glob("*.xlsx")))
+        except Exception:
+            pass
+
+        return {
+            "status": "ok",
+            "message": f"Data root linked to: {new_path}",
+            "data_root": str(new_path),
+            "location_folders_found": loc_count,
+            "office_workbooks_found": office_count,
+        }
 
     # -- Server -------------------------------------------------------------
     HOST: str = os.getenv("HOST", "127.0.0.1")
@@ -236,11 +313,15 @@ def get_config_snapshot() -> dict[str, Any]:
         "FERNET_KEY": _mask_secret(settings.FERNET_KEY),
         "FERNET_KEY_length": len(settings.FERNET_KEY),
         "ALLOWED_ORIGINS": _serialize_list(settings.ALLOWED_ORIGINS),
-        "EXCEL_FILE_PATH": str(settings.EXCEL_FILE_PATH),
+        "DATA_ROOT": str(settings.DATA_ROOT),
         "EXCEL_SHEET_NAME": settings.EXCEL_SHEET_NAME,
         "HOST": settings.HOST,
         "PORT": settings.PORT,
         "BRIDGE_ID": settings.BRIDGE_ID,
+        "BRIDGE_LOCATION": settings.BRIDGE_LOCATION,
+        "BRIDGE_OFFICE": settings.BRIDGE_OFFICE,
+        "BRIDGE_IS_MAIN": settings.BRIDGE_IS_MAIN,
+        "BRIDGE_IS_APPROVED": settings.BRIDGE_IS_APPROVED,
     }
 
 
@@ -257,7 +338,8 @@ def update_env_file(updates: dict[str, str | int]) -> dict[str, str]:
         "API_KEY",
         "FERNET_KEY",
         "ALLOWED_ORIGINS",
-        "EXCEL_FILE_PATH",
+        "DATA_ROOT",
+        "EXCEL_DIR",
         "EXCEL_SHEET_NAME",
         "HOST",
         "PORT",
@@ -365,7 +447,7 @@ def detect_safe_path() -> dict[str, str]:
     Public entry-point for the admin UI to query the recommended safe
     data path.  Returns a dict with `path` and `reason` keys.
     """
-    safe = _detect_safe_data_partition()
+    safe = _detect_safe_data_root()
     if safe is not None:
         drive = safe.drive
         return {
@@ -373,6 +455,6 @@ def detect_safe_path() -> dict[str, str]:
             "reason": f"Using non-system drive {drive} (>100 GB). Data survives Windows reinstall.",
         }
     return {
-        "path": str(BASE_DIR / "data.xlsx"),
+        "path": str(BASE_DIR / "data"),
         "reason": "No suitable non-system partition found. Using app directory (⚠ not reformat-safe).",
     }

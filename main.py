@@ -122,9 +122,17 @@ class UpdatePayload(BaseModel):
         description="Fernet-encrypted, Base64-encoded JSON payload.",
         min_length=1,
     )
+    office: str = Field(
+        default="",
+        description="Office name — determines which Excel workbook to use ({office}.xlsx).",
+    )
     sheet_name: str = Field(
         default="",
-        description="Target Excel sheet name. Auto-created if missing.",
+        description="Target Excel sheet (section) name. Auto-created if missing.",
+    )
+    location: str = Field(
+        default="",
+        description="Location folder name. Falls back to BRIDGE_LOCATION if empty.",
     )
 
 
@@ -183,6 +191,14 @@ class CommandRequest(BaseModel):
         ...,
         description="Command string (e.g. 'ADD {\"col\":\"val\"}'). Prefix / optional.",
         min_length=1,
+    )
+    office: str = Field(
+        default="",
+        description="Office name — determines which Excel workbook to use.",
+    )
+    sheet_name: str = Field(
+        default="",
+        description="Target sheet name for the command.",
     )
 
 
@@ -254,6 +270,14 @@ async def root_page():
     except Exception:
         local_ip = "127.0.0.1"
 
+    # Build data structure display
+    loc = settings.BRIDGE_LOCATION.strip()
+    if loc:
+        safe_loc = "".join(c for c in loc if c.isalnum() or c in (" ", "-", "_", ".")).strip()
+        data_structure = f"{{DATA_ROOT}}/{safe_loc}/{{office}}.xlsx → sheets = sections"
+    else:
+        data_structure = "{DATA_ROOT}/{office}.xlsx → sheets = sections"
+
     return HTMLResponse(content=_ROOT_HTML.format(
         hostname=hostname,
         local_ip=local_ip,
@@ -262,7 +286,8 @@ async def root_page():
         python_ver=platform.python_version(),
         port=settings.PORT,
         bridge_url=f"http://{local_ip}:{settings.PORT}",
-        excel_file=str(settings.EXCEL_FILE_PATH),
+        data_root=str(settings.DATA_ROOT),
+        data_structure=data_structure,
         sheet_name=settings.EXCEL_SHEET_NAME,
         api_key=settings.API_KEY,
         fernet_key=settings.FERNET_KEY,
@@ -303,7 +328,7 @@ async def machine_info() -> dict[str, Any]:
             "bridge_url": f"http://{local_ip}:{settings.PORT}",
         },
         "config_summary": {
-            "excel_file": str(settings.EXCEL_FILE_PATH),
+            "data_root": str(settings.DATA_ROOT),
             "sheet_name": settings.EXCEL_SHEET_NAME,
             "api_key_fingerprint": settings.API_KEY[:8] + "..." + settings.API_KEY[-4:],
             "fernet_key_fingerprint": settings.FERNET_KEY[:8] + "...",
@@ -317,30 +342,39 @@ async def machine_info() -> dict[str, Any]:
     response_model=DataResponse,
     dependencies=[Depends(require_auth)],
 )
-async def get_data(sheet: str = "") -> DataResponse:
+async def get_data(office: str = "", sheet: str = "", location: str = "") -> DataResponse:
     """
-    Read the configured Excel file and return all rows as JSON.
+    Read the office-specific Excel workbook and return all rows as JSON.
+
+    Folder structure: {DATA_ROOT}/{location}/{office}.xlsx
 
     Query params:
-      sheet  — Optional sheet name. If provided, reads from that sheet.
-               Otherwise uses the configured default sheet.
+      office   — Office name (determines which .xlsx file to open).
+      sheet    — Optional sheet (section) name. If provided, reads from that sheet.
+                 Otherwise uses the configured default sheet.
+      location — Optional location folder. Falls back to BRIDGE_LOCATION if empty.
 
     Returns 404 if the file or sheet does not exist.
     """
-    path: Path = settings.EXCEL_FILE_PATH
+    office_name = office.strip()
+    location_name = location.strip()
+    path: Path = settings.get_office_excel_path(office_name, location_name) if office_name else settings.DATA_ROOT / "data.xlsx"
     sheet_name = sheet.strip() if sheet else settings.EXCEL_SHEET_NAME
 
+    # Auto-create the workbook + sheet if it doesn't exist yet
     if not path.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Excel file not found at {path}",
-        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df_empty = pd.DataFrame(columns=["Date & Time", "Barcode", "Action"])
+        df_empty.to_excel(str(path), sheet_name=sheet_name, index=False)
 
     try:
         # Check if the sheet exists
         xl = pd.ExcelFile(path)
         if sheet_name not in xl.sheet_names:
-            # Sheet doesn't exist — return empty dataset (don't error)
+            # Sheet doesn't exist — create it and return empty dataset
+            with pd.ExcelWriter(str(path), engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+                df_empty = pd.DataFrame(columns=["Date & Time", "Barcode", "Action"])
+                df_empty.to_excel(writer, sheet_name=sheet_name, index=False)
             return DataResponse(
                 sheet_name=sheet_name,
                 row_count=0,
@@ -374,11 +408,17 @@ async def get_data(sheet: str = "") -> DataResponse:
     "/sheets",
     dependencies=[Depends(require_auth)],
 )
-async def list_sheets() -> dict[str, Any]:
+async def list_sheets(office: str = "", location: str = "") -> dict[str, Any]:
     """
-    Return all sheet names from the Excel file.
+    Return all sheet names from the office-specific Excel workbook.
+
+    Query params:
+      office   — Office name (determines which .xlsx file to open).
+      location — Optional location folder. Falls back to BRIDGE_LOCATION if empty.
     """
-    path: Path = settings.EXCEL_FILE_PATH
+    office_name = office.strip()
+    location_name = location.strip()
+    path: Path = settings.get_office_excel_path(office_name, location_name) if office_name else settings.DATA_ROOT / "data.xlsx"
     if not path.is_file():
         return {"sheets": []}
     try:
@@ -424,25 +464,28 @@ async def update_data(payload: UpdatePayload) -> UpdateResponse:
             detail="Decrypted payload must be a JSON array of objects.",
         )
 
+    # Determine the office-specific Excel file path
+    office_name = payload.office.strip()
+    location_name = payload.location.strip()
+    file_path: Path = settings.get_office_excel_path(office_name, location_name) if office_name else settings.DATA_ROOT / "data.xlsx"
+    target_sheet = payload.sheet_name.strip() if payload.sheet_name else settings.EXCEL_SHEET_NAME
+
     if not records:
         # Empty dataset = clear the sheet (keep the sheet, remove all rows)
         try:
-            path: Path = settings.EXCEL_FILE_PATH
-            target_sheet = payload.sheet_name.strip() if payload.sheet_name else settings.EXCEL_SHEET_NAME
-
-            if path.is_file():
+            if file_path.is_file():
                 import openpyxl
-                tmp_path = path.with_suffix(".tmp.xlsx")
-                wb = openpyxl.load_workbook(path)
+                tmp_path = file_path.with_suffix(".tmp.xlsx")
+                wb = openpyxl.load_workbook(file_path)
                 if target_sheet in wb.sheetnames:
                     ws = wb[target_sheet]
                     # Delete all rows except header
                     ws.delete_rows(1, ws.max_row)
                 wb.save(tmp_path)
                 wb.close()
-                _safe_atomic_replace(tmp_path, path)
+                _safe_atomic_replace(tmp_path, file_path)
             return UpdateResponse(
-                message=f"Sheet '{target_sheet}' cleared successfully.",
+                message=f"Sheet '{target_sheet}' cleared successfully in '{file_path.name}'.",
                 rows_written=0,
             )
         except Exception as exc:
@@ -454,21 +497,19 @@ async def update_data(payload: UpdatePayload) -> UpdateResponse:
     # 3. Convert to DataFrame and write
     try:
         df: pd.DataFrame = pd.DataFrame(records)
-        path: Path = settings.EXCEL_FILE_PATH
-        target_sheet = payload.sheet_name.strip() if payload.sheet_name else settings.EXCEL_SHEET_NAME
 
         # Ensure parent directory exists
-        path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Write to a temporary file first, then atomically replace.
-        tmp_path = path.with_suffix(".tmp.xlsx")
+        tmp_path = file_path.with_suffix(".tmp.xlsx")
 
         # If the file already exists, we need to preserve other sheets.
         # Read existing workbook, update/add the target sheet, then write.
-        if path.is_file():
+        if file_path.is_file():
             import openpyxl
             try:
-                wb = openpyxl.load_workbook(path)
+                wb = openpyxl.load_workbook(file_path)
             except Exception:
                 wb = openpyxl.Workbook()
             # Remove target sheet if it exists, then recreate it
@@ -493,7 +534,7 @@ async def update_data(payload: UpdatePayload) -> UpdateResponse:
                 sheet_name=target_sheet,
                 index=False,
             )
-        _safe_atomic_replace(tmp_path, path)
+        _safe_atomic_replace(tmp_path, file_path)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -501,7 +542,7 @@ async def update_data(payload: UpdatePayload) -> UpdateResponse:
         )
 
     return UpdateResponse(
-        message=f"Excel file updated successfully at {path}",
+        message=f"Excel file updated successfully at {file_path}",
         rows_written=len(df),
     )
 
@@ -527,9 +568,13 @@ async def execute_command(payload: CommandRequest, request: Request):
       SHOW
       HELP
     """
+    office_name = payload.office.strip()
+    cmd_path: Path = settings.get_office_excel_path(office_name) if office_name else settings.DATA_ROOT / "data.xlsx"
+    cmd_sheet = payload.sheet_name.strip() if payload.sheet_name else settings.EXCEL_SHEET_NAME
+
     engine = CommandEngine(
-        excel_path=settings.EXCEL_FILE_PATH,
-        sheet_name=settings.EXCEL_SHEET_NAME,
+        excel_path=cmd_path,
+        sheet_name=cmd_sheet,
     )
 
     # Block write commands on non-main bridges
@@ -581,8 +626,8 @@ async def update_config(payload: ConfigUpdatePayload) -> ConfigUpdateResult:
     (HOST, PORT, CORS) to take effect.  API_KEY and FERNET_KEY take
     effect on the next request.
     """
-    old_excel_path = settings.EXCEL_FILE_PATH
-    new_excel_path_raw = payload.updates.get("EXCEL_FILE_PATH")
+    old_excel_dir = settings.DATA_ROOT
+    new_excel_dir_raw = payload.updates.get("EXCEL_DIR") or payload.updates.get("DATA_ROOT")
 
     # ------------------------------------------------------------------
     # Extract FRESH_DATA_FILE flag BEFORE passing to update_env_file
@@ -596,86 +641,57 @@ async def update_config(payload: ConfigUpdatePayload) -> ConfigUpdateResult:
 
     results = update_env_file(payload.updates)
 
-    # --- Auto-move / create Excel file if path changed ---
-    if new_excel_path_raw:
-        new_excel_path = Path(str(new_excel_path_raw).strip()).resolve()
+    # --- Auto-create Excel data directory if path changed ---
+    if new_excel_dir_raw:
+        new_excel_dir = Path(str(new_excel_dir_raw).strip()).resolve()
 
         # Only act if the path actually changed
-        if new_excel_path != old_excel_path.resolve():
+        if new_excel_dir != old_excel_dir.resolve():
             try:
                 # Ensure the target directory exists
-                new_excel_path.parent.mkdir(parents=True, exist_ok=True)
+                new_excel_dir.mkdir(parents=True, exist_ok=True)
 
-                if fresh_data_file:
-                    # ------------------------------------------------------------------
-                    # FRESH — create a new empty Excel file with default headers
-                    # ------------------------------------------------------------------
+                # Recursively migrate ALL .xlsx files preserving folder tree.
+                # Handles both flat ({office}.xlsx) and hierarchical
+                # ({location}/{office}.xlsx) layouts.
+                if old_excel_dir.is_dir():
                     import openpyxl
-                    wb = openpyxl.Workbook()
-                    ws = wb.active
-                    ws.title = settings.EXCEL_SHEET_NAME
-                    # Write default headers
-                    headers = ["Date & Time", "Barcode", "Action"]
-                    for col_idx, header in enumerate(headers, 1):
-                        ws.cell(row=1, column=col_idx, value=header)
-                    wb.save(str(new_excel_path))
-                    wb.close()
+                    migrated = 0
+                    for old_file in old_excel_dir.rglob("*.xlsx"):
+                        rel_path = old_file.relative_to(old_excel_dir)
+                        new_file = new_excel_dir / rel_path
+                        if not fresh_data_file and not new_file.exists():
+                            new_file.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(str(old_file), str(new_file))
+                            migrated += 1
 
-                    results["EXCEL_FILE_MOVED"] = (
-                        f"Fresh empty data file created at '{new_excel_path}'. "
-                        f"Old file left untouched at '{old_excel_path}'."
-                    )
-                    log_path_change(
-                        str(old_excel_path),
-                        str(new_excel_path),
-                        "fresh",
-                    )
-                elif old_excel_path.is_file():
-                    # ------------------------------------------------------------------
-                    # MOVE — copy existing data to new location
-                    # ------------------------------------------------------------------
-                    shutil.copy2(str(old_excel_path), str(new_excel_path))
-                    results["EXCEL_FILE_MOVED"] = (
-                        f"Data copied from '{old_excel_path}' → '{new_excel_path}'."
-                        f" You may delete the old file manually if desired."
-                    )
-                    log_path_change(
-                        str(old_excel_path),
-                        str(new_excel_path),
-                        "move",
-                    )
+                    if migrated > 0:
+                        results["DIR_MIGRATED"] = (
+                            f"Migrated {migrated} workbook(s) from '{old_excel_dir}' → '{new_excel_dir}' "
+                            f"(preserving folder structure). You may delete the old directory manually if desired."
+                        )
+                    else:
+                        results["DIR_MIGRATED"] = (
+                            f"Data directory set to '{new_excel_dir}' (no files to migrate)."
+                        )
                 else:
-                    # ------------------------------------------------------------------
-                    # Old file doesn't exist — create a fresh one at the new path
-                    # ------------------------------------------------------------------
-                    import openpyxl
-                    wb = openpyxl.Workbook()
-                    ws = wb.active
-                    ws.title = settings.EXCEL_SHEET_NAME
-                    headers = ["Date & Time", "Barcode", "Action"]
-                    for col_idx, header in enumerate(headers, 1):
-                        ws.cell(row=1, column=col_idx, value=header)
-                    wb.save(str(new_excel_path))
-                    wb.close()
+                    results["DIR_MIGRATED"] = (
+                        f"Data directory created at '{new_excel_dir}'."
+                    )
 
-                    results["EXCEL_FILE_MOVED"] = (
-                        f"New data file created at '{new_excel_path}' "
-                        f"(old file did not exist at '{old_excel_path}')."
-                    )
-                    log_path_change(
-                        str(old_excel_path),
-                        str(new_excel_path),
-                        "fresh",
-                    )
+                log_path_change(
+                    str(old_excel_dir),
+                    str(new_excel_dir),
+                    "fresh" if fresh_data_file else "move",
+                )
             except Exception as exc:
-                results["EXCEL_FILE_MOVED"] = (
-                    f"WARNING: Could not copy data to new location: {exc}. "
-                    f"Old file still at '{old_excel_path}'. "
-                    f"Please manually copy it to '{new_excel_path}'."
+                results["EXCEL_DIR_MOVED"] = (
+                    f"WARNING: Could not set up data directory: {exc}. "
+                    f"Old dir still at '{old_excel_dir}'. "
                 )
                 log_path_change(
-                    str(old_excel_path),
-                    str(new_excel_path),
+                    str(old_excel_dir),
+                    str(new_excel_dir),
                     "move",
                     extra={"error": str(exc)},
                 )
@@ -715,6 +731,42 @@ async def get_safe_path() -> dict[str, str]:
     Returns the recommended path and a human-readable reason.
     """
     return detect_safe_path()
+
+
+class LinkDatabasePayload(BaseModel):
+    """Payload for linking the bridge to an existing data folder."""
+    data_root: str = Field(
+        ...,
+        description="Path to the existing data root folder (e.g., from a backup).",
+        min_length=1,
+    )
+
+
+@app.post(
+    "/api/link-database",
+    dependencies=[Depends(require_auth)],
+)
+async def link_database(payload: LinkDatabasePayload) -> dict:
+    """
+    Link this bridge to an existing data folder.
+
+    Use this when installing a bridge on a new PC to restore data from a
+    previous installation (e.g., after formatting Windows). Point to the
+    backup folder and the bridge will use it as its database from that
+    point onward.
+
+    The expected folder structure is:
+        {data_root}/
+          {location_name}/
+            {office_name}.xlsx   (with sheets = sections)
+    """
+    result = settings.link_data_root(payload.data_root)
+    if result["status"] == "error":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result["message"],
+        )
+    return result
 
 
 # ===================================================================
@@ -877,8 +929,16 @@ _ROOT_HTML = """<!DOCTYPE html>
                 <div class="value">{python_ver}</div>
             </div>
             <div class="info-item">
-                <div class="label">Excel File</div>
-                <div class="value">{excel_file}</div>
+                <div class="label">Data Root</div>
+                <div class="value" style="font-size:0.8rem;">{data_root}</div>
+            </div>
+            <div class="info-item">
+                <div class="label">Data Structure</div>
+                <div class="value" style="font-size:0.75rem;">{data_structure}</div>
+            </div>
+            <div class="info-item">
+                <div class="label">Sheet Name</div>
+                <div class="value">{sheet_name}</div>
             </div>
             <div class="info-item">
                 <div class="label">Bridge ID</div>
@@ -1380,16 +1440,17 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         <input type="text" id="cfg-origins" placeholder="http://localhost:3000">
       </div>
 
-      <!-- Excel File Path -->
+      <!-- Data Root Directory -->
       <div class="form-group">
-        <label for="cfg-excel-path">Excel File Path</label>
+        <label for="cfg-excel-path">Data Root Directory</label>
         <div class="input-row">
-          <input type="text" id="cfg-excel-path" placeholder="data.xlsx">
+          <input type="text" id="cfg-excel-path" placeholder="data">
           <button type="button" class="btn btn-outline btn-sm"
                   onclick="detectSafePath()" title="Auto-detect safe partition for data">&#128194; Safe Path</button>
         </div>
         <p style="font-size:.7rem;color:var(--sub);margin-top:4px;" id="excel-path-hint">
-          Store data on a non-system drive to keep it safe if Windows is reformatted.
+          Folder structure: {DATA_ROOT}/{location}/{office}.xlsx (sheets = sections).
+          Store on a non-system drive to keep data safe if Windows is reformatted.
         </p>
         <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer; font-weight:400; margin-top:8px; font-size:.8rem; color:var(--sub);">
           <input type="checkbox" id="cfg-fresh-data" style="width:auto; margin:0; accent-color:var(--accent);">
@@ -1506,7 +1567,7 @@ function populateForm(cfg) {
   document.getElementById('cfg-api-key').value = cfg.API_KEY || '';
   document.getElementById('cfg-fernet-key').value = cfg.FERNET_KEY || '';
   document.getElementById('cfg-origins').value = cfg.ALLOWED_ORIGINS || '';
-  document.getElementById('cfg-excel-path').value = cfg.EXCEL_FILE_PATH || '';
+  document.getElementById('cfg-excel-path').value = cfg.DATA_ROOT || '';
   document.getElementById('cfg-sheet').value = cfg.EXCEL_SHEET_NAME || '';
   document.getElementById('cfg-host').value = cfg.HOST || '';
   document.getElementById('cfg-port').value = cfg.PORT || '';
@@ -1567,7 +1628,7 @@ async function saveConfig() {
     'API_KEY':        document.getElementById('cfg-api-key').value.trim(),
     'FERNET_KEY':     document.getElementById('cfg-fernet-key').value.trim(),
     'ALLOWED_ORIGINS': document.getElementById('cfg-origins').value.trim(),
-    'EXCEL_FILE_PATH': document.getElementById('cfg-excel-path').value.trim(),
+    'DATA_ROOT': document.getElementById('cfg-excel-path').value.trim(),
     'EXCEL_SHEET_NAME': document.getElementById('cfg-sheet').value.trim(),
     'HOST':           document.getElementById('cfg-host').value.trim(),
     'PORT':           parseInt(document.getElementById('cfg-port').value.trim(), 10),
@@ -1790,7 +1851,7 @@ if __name__ == "__main__":
     print(f"  Health     : http://{local_ip}:{settings.PORT}/health")
     print(f"  Info       : http://{local_ip}:{settings.PORT}/info")
     print(f"  Admin      : http://{local_ip}:{settings.PORT}/admin")
-    print(f"  Data File  : {settings.EXCEL_FILE_PATH}")
+    print(f"  Data Dir   : {settings.DATA_ROOT}")
     print("-" * 60)
     print("  💡 To make this bridge reachable from the internet:")
     print("     1. Port forwarding: forward port 8000 on your router")
