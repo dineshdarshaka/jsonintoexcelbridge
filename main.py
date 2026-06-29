@@ -701,6 +701,30 @@ async def update_config(payload: ConfigUpdatePayload) -> ConfigUpdateResult:
     )
 
 
+@app.post(
+    "/api/restart",
+    dependencies=[Depends(require_auth)],
+)
+async def restart_bridge() -> dict[str, str]:
+    """
+    Restart the bridge process gracefully.
+
+    A background thread waits 1 second for the HTTP response to be
+    sent, then replaces the current process with a fresh instance via
+    ``os.execl`` (same executable + same arguments).
+    """
+    import threading
+
+    def _do_restart():
+        time.sleep(1)
+        # Use os.execl to replace the current process — preserves PID,
+        # re-reads .env, and picks up any changed HOST/PORT/CORS settings.
+        os.execl(sys.executable, sys.executable, *sys.argv)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
+    return {"status": "ok", "message": "Bridge is restarting..."}
+
+
 @app.get(
     "/config/generate-api-key",
     dependencies=[Depends(require_auth)],
@@ -1866,16 +1890,17 @@ async function saveConfig() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Save failed');
 
-    let msg = 'Configuration saved! Restart the server for all changes to take effect.';
-    if (data.results && data.results.EXCEL_FILE_MOVED) {
-      msg = '✅ ' + data.results.EXCEL_FILE_MOVED.replace(/\\n/g, ' ');
+    let msg = 'Configuration saved! Restarting bridge...';
+    if (data.results && data.results.DIR_MIGRATED) {
+      msg = '✅ ' + data.results.DIR_MIGRATED.replace(/\\n/g, ' ') + ' Restarting...';
     }
     showToast(msg, 'success');
-    // Refresh the displayed config
-    const cfgRes = await fetch('/config', { headers: headers() });
-    if (cfgRes.ok) {
-      const cfgData = await cfgRes.json();
-      populateForm(cfgData.config);
+
+    // Trigger restart — bridge will come back with new settings
+    try {
+      await fetch('/api/restart', { method: 'POST', headers: headers() });
+    } catch (e) {
+      // Expected — the bridge process dies, so the fetch will fail
     }
   } catch (e) {
     showToast('Save failed: ' + e.message, 'error');

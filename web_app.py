@@ -274,6 +274,17 @@ def auto_archive_manual():
         return jsonify({"error": "Bridge unreachable"}), 503
 
 
+@app.route("/api/restart", methods=["POST"])
+def restart_bridge():
+    """Proxy POST /api/restart → bridge (bridge will restart and be briefly unreachable)."""
+    try:
+        resp = requests.post(f"{BRIDGE_URL}/api/restart",
+                           headers=_bridge_headers(), timeout=30)
+        return jsonify(resp.json()), resp.status_code
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Bridge unreachable"}), 503
+
+
 # ===================================================================
 # Entry point
 # ===================================================================
