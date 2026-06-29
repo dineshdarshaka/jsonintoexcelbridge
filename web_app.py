@@ -225,6 +225,56 @@ def health():
 
 
 # ===================================================================
+# Auto-Archive proxy endpoints
+# ===================================================================
+
+
+@app.route("/api/auto-archive/status")
+def auto_archive_status():
+    """Proxy GET /api/auto-archive/status → bridge."""
+    try:
+        resp = requests.get(f"{BRIDGE_URL}/api/auto-archive/status", headers=_bridge_headers(), timeout=10)
+        return jsonify(resp.json()), resp.status_code
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Bridge unreachable"}), 503
+
+
+@app.route("/api/auto-archive/settings", methods=["POST"])
+def auto_archive_settings():
+    """Proxy POST /api/auto-archive/settings → bridge."""
+    body = request.get_json(silent=True) or {}
+    try:
+        resp = requests.post(f"{BRIDGE_URL}/api/auto-archive/settings",
+                           headers=_bridge_headers(), json=body, timeout=10)
+        return jsonify(resp.json()), resp.status_code
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Bridge unreachable"}), 503
+
+
+@app.route("/api/auto-archive/check", methods=["POST"])
+def auto_archive_check():
+    """Proxy POST /api/auto-archive/check → bridge."""
+    try:
+        resp = requests.post(f"{BRIDGE_URL}/api/auto-archive/check",
+                           headers=_bridge_headers(), timeout=10)
+        return jsonify(resp.json()), resp.status_code
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Bridge unreachable"}), 503
+
+
+@app.route("/api/auto-archive/archive", methods=["POST"])
+def auto_archive_manual():
+    """Proxy POST /api/auto-archive/archive → bridge."""
+    body = request.get_json(silent=True) or {}
+    try:
+        resp = requests.post(f"{BRIDGE_URL}/api/auto-archive/archive",
+                           headers=_bridge_headers(), json=body, timeout=10)
+        return jsonify(resp.json()), resp.status_code
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Bridge unreachable"}), 503
+
+
+# ===================================================================
 # Entry point
 # ===================================================================
 

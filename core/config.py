@@ -126,6 +126,9 @@ if not ENV_PATH.is_file():
         "EXCEL_SHEET_NAME=Sheet1",
         "HOST=127.0.0.1",
         "PORT=8000",
+        "AUTO_ARCHIVE_ENABLED=true",
+        "AUTO_ARCHIVE_MAX_ROWS=1000000",
+        "AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES=60",
     ]
     with open(str(ENV_PATH), "w", encoding="utf-8") as _f:
         _f.write("\n".join(_lines) + "\n")
@@ -198,6 +201,14 @@ class Settings:
         DATA_ROOT: Path = _raw_data_root
 
     EXCEL_SHEET_NAME: str = os.getenv("EXCEL_SHEET_NAME", "Sheet1")
+
+    # -- Auto-Archive Settings ------------------------------------------------
+    # When enabled, the bridge periodically checks all sheets and auto-archives
+    # any sheet whose row count exceeds AUTO_ARCHIVE_MAX_ROWS.
+    # Archives are named {sheetName}.old → {sheetName}.old1 → {sheetName}.old2 …
+    AUTO_ARCHIVE_ENABLED: bool = os.getenv("AUTO_ARCHIVE_ENABLED", "true").lower() in ("true", "1", "yes")
+    AUTO_ARCHIVE_MAX_ROWS: int = int(os.getenv("AUTO_ARCHIVE_MAX_ROWS", "1000000"))
+    AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES: int = int(os.getenv("AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES", "60"))
 
     @staticmethod
     def get_office_excel_path(office_name: str, location: str = "") -> Path:
@@ -322,6 +333,9 @@ def get_config_snapshot() -> dict[str, Any]:
         "BRIDGE_OFFICE": settings.BRIDGE_OFFICE,
         "BRIDGE_IS_MAIN": settings.BRIDGE_IS_MAIN,
         "BRIDGE_IS_APPROVED": settings.BRIDGE_IS_APPROVED,
+        "AUTO_ARCHIVE_ENABLED": settings.AUTO_ARCHIVE_ENABLED,
+        "AUTO_ARCHIVE_MAX_ROWS": settings.AUTO_ARCHIVE_MAX_ROWS,
+        "AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES": settings.AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES,
     }
 
 
@@ -348,6 +362,9 @@ def update_env_file(updates: dict[str, str | int]) -> dict[str, str]:
         "BRIDGE_IS_APPROVED",
         "BRIDGE_LOCATION",
         "BRIDGE_OFFICE",
+        "AUTO_ARCHIVE_ENABLED",
+        "AUTO_ARCHIVE_MAX_ROWS",
+        "AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES",
     }
 
     results: dict[str, str] = {}

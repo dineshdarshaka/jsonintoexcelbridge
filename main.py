@@ -770,6 +770,157 @@ async def link_database(payload: LinkDatabasePayload) -> dict:
 
 
 # ===================================================================
+# Auto-Archive API (auth-protected)
+# ===================================================================
+
+
+class AutoArchiveSettingsPayload(BaseModel):
+    """Payload for updating auto-archive settings."""
+    enabled: bool | None = None
+    max_rows: int | None = Field(default=None, ge=1000, le=1048575,
+                                   description="Row threshold for auto-archive (1000–1048575)")
+    check_interval_minutes: int | None = Field(default=None, ge=1, le=10080,
+                                                description="Check interval in minutes (1–10080)")
+
+
+class ManualArchivePayload(BaseModel):
+    """Payload for manually archiving a specific sheet."""
+    workbook: str = Field(..., description="Path to the .xlsx workbook", min_length=1)
+    sheet_name: str = Field(..., description="Name of the sheet to archive", min_length=1)
+
+
+@app.get(
+    "/api/auto-archive/status",
+    dependencies=[Depends(require_auth)],
+)
+async def auto_archive_status() -> dict[str, Any]:
+    """
+    Return the current status of the auto-archive monitor:
+      - enabled / max_rows / check_interval_minutes
+      - last and next check times
+      - sheets monitored
+      - most recent archive result
+    """
+    from core.auto_archive import get_monitor
+
+    monitor = get_monitor()
+    if monitor is None:
+        return {
+            "enabled": settings.AUTO_ARCHIVE_ENABLED,
+            "max_rows": settings.AUTO_ARCHIVE_MAX_ROWS,
+            "check_interval_minutes": settings.AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES,
+            "running": False,
+            "message": "Auto-archive monitor is not running. Restart the bridge with AUTO_ARCHIVE_ENABLED=true.",
+        }
+    status = monitor.get_status()
+    status["running"] = True
+    return status
+
+
+@app.post(
+    "/api/auto-archive/settings",
+    dependencies=[Depends(require_auth)],
+)
+async def auto_archive_update_settings(payload: AutoArchiveSettingsPayload) -> dict[str, Any]:
+    """
+    Update auto-archive settings and persist them to .env.
+
+    Changes take effect immediately — no restart required.
+    """
+    from core.auto_archive import get_monitor
+
+    updates: dict[str, str | int] = {}
+    if payload.enabled is not None:
+        updates["AUTO_ARCHIVE_ENABLED"] = str(payload.enabled).lower()
+    if payload.max_rows is not None:
+        updates["AUTO_ARCHIVE_MAX_ROWS"] = str(payload.max_rows)
+    if payload.check_interval_minutes is not None:
+        updates["AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES"] = str(payload.check_interval_minutes)
+
+    if not updates:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No settings provided.")
+
+    results = update_env_file(updates)
+
+    # Update runtime settings
+    if payload.enabled is not None:
+        settings.AUTO_ARCHIVE_ENABLED = payload.enabled
+    if payload.max_rows is not None:
+        settings.AUTO_ARCHIVE_MAX_ROWS = payload.max_rows
+    if payload.check_interval_minutes is not None:
+        settings.AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES = payload.check_interval_minutes
+
+    return {
+        "status": "ok",
+        "results": results,
+        "current": {
+            "enabled": settings.AUTO_ARCHIVE_ENABLED,
+            "max_rows": settings.AUTO_ARCHIVE_MAX_ROWS,
+            "check_interval_minutes": settings.AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES,
+        },
+    }
+
+
+@app.post(
+    "/api/auto-archive/check",
+    dependencies=[Depends(require_auth)],
+)
+async def auto_archive_check_now() -> dict[str, Any]:
+    """
+    Force an immediate check of all sheets for row threshold exceedance.
+    Archives any sheet that is over the configured max_rows limit.
+    """
+    from core.auto_archive import get_monitor
+
+    monitor = get_monitor()
+    if monitor is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Auto-archive monitor is not running. Restart the bridge.",
+        )
+    return monitor.check_now()
+
+
+@app.post(
+    "/api/auto-archive/archive",
+    dependencies=[Depends(require_auth)],
+)
+async def auto_archive_manual(payload: ManualArchivePayload) -> dict[str, Any]:
+    """
+    Manually archive a specific sheet in a specific workbook.
+
+    The sheet is copied to {sheetName}.old (or .old1, .old2 …),
+    cleared (header preserved), and marker notes are added to both
+    the old (archived) and new (fresh) copies.
+    """
+    from core.auto_archive import get_monitor
+
+    monitor = get_monitor()
+    if monitor is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Auto-archive monitor is not running. Restart the bridge.",
+        )
+
+    path = Path(payload.workbook)
+    if not path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Workbook not found: {payload.workbook}",
+        )
+
+    try:
+        result = monitor.archive_sheet(path, payload.sheet_name)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Archive failed: {exc!s}",
+        )
+
+    return {"status": "ok", "archive": result}
+
+
+# ===================================================================
 # Admin dashboard (HTML page)
 # ===================================================================
 
@@ -1466,6 +1617,65 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 
       <hr class="divider">
 
+      <!-- ===== AUTO-ARCHIVE SECTION ===== -->
+      <div class="card-header" style="margin-top:0;margin-bottom:12px;">
+        <h2 style="font-size:1.1rem;">&#128451;&#65039; Auto-Archive</h2>
+        <p>Periodically archive sheets when they exceed the row limit.</p>
+      </div>
+      <div id="archive-toast" class="toast"></div>
+
+      <!-- Enabled toggle -->
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;text-transform:uppercase;letter-spacing:.04em;font-size:.8125rem;">
+          <input type="checkbox" id="cfg-archive-enabled" style="width:auto;margin:0;accent-color:var(--accent);"
+                 onchange="document.getElementById('archive-settings-group').style.display = this.checked ? '' : 'none'">
+          Enable Auto-Archive
+        </label>
+      </div>
+
+      <!-- Settings (hidden when disabled) -->
+      <div id="archive-settings-group">
+        <div style="display:flex;gap:12px;">
+          <div class="form-group" style="flex:1;">
+            <label for="cfg-archive-max-rows">Max Rows (1,000 – 1,048,575)</label>
+            <input type="number" id="cfg-archive-max-rows" min="1000" max="1048575" step="1000" placeholder="1000000">
+            <p style="font-size:.7rem;color:var(--sub);margin-top:3px;">
+              Sheet rows above this threshold will be auto-archived.
+            </p>
+          </div>
+          <div class="form-group" style="flex:1;">
+            <label for="cfg-archive-interval">Check Interval (minutes)</label>
+            <input type="number" id="cfg-archive-interval" min="1" max="10080" step="1" placeholder="60">
+            <p style="font-size:.7rem;color:var(--sub);margin-top:3px;">
+              How often to scan sheets (1 – 10,080 min = 7 days).
+            </p>
+          </div>
+        </div>
+
+        <!-- Status display -->
+        <div style="background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:14px;font-size:.8rem;">
+          <div style="display:flex;gap:24px;flex-wrap:wrap;">
+            <span id="archive-status-last">Last check: —</span>
+            <span id="archive-status-next">Next check: —</span>
+            <span id="archive-status-sheets">Sheets: —</span>
+          </div>
+        </div>
+
+        <div class="actions" style="flex-wrap:wrap;">
+          <button type="button" class="btn btn-primary" onclick="saveArchiveSettings()" style="flex:1;">
+            &#128190; Save Archive Settings
+          </button>
+          <button type="button" class="btn btn-outline" onclick="checkNow()">
+            &#128269; Check Now
+          </button>
+          <button type="button" class="btn btn-outline" onclick="refreshArchiveStatus()">
+            &#128259; Refresh Status
+          </button>
+        </div>
+      </div>
+
+      <hr class="divider">
+
       <!-- Host / Port side by side -->
       <div style="display:flex;gap:12px;">
         <div class="form-group" style="flex:2;">
@@ -1571,6 +1781,16 @@ function populateForm(cfg) {
   document.getElementById('cfg-sheet').value = cfg.EXCEL_SHEET_NAME || '';
   document.getElementById('cfg-host').value = cfg.HOST || '';
   document.getElementById('cfg-port').value = cfg.PORT || '';
+
+  // Auto-archive settings
+  var archEnabled = cfg.AUTO_ARCHIVE_ENABLED === true || cfg.AUTO_ARCHIVE_ENABLED === 'true';
+  document.getElementById('cfg-archive-enabled').checked = archEnabled;
+  document.getElementById('archive-settings-group').style.display = archEnabled ? '' : 'none';
+  document.getElementById('cfg-archive-max-rows').value = cfg.AUTO_ARCHIVE_MAX_ROWS || 1000000;
+  document.getElementById('cfg-archive-interval').value = cfg.AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES || 60;
+
+  // Refresh live status
+  refreshArchiveStatus();
 }
 
 // ------------------------------------------------------------------
@@ -1671,6 +1891,85 @@ async function saveConfig() {
     }
   } catch (e) {
     showToast('Save failed: ' + e.message, 'error');
+  }
+}
+
+// ------------------------------------------------------------------
+// Auto-Archive functions
+// ------------------------------------------------------------------
+function showArchiveToast(msg, type) {
+  var t = document.getElementById('archive-toast');
+  t.textContent = msg;
+  t.className = 'toast toast-' + type + ' show';
+  setTimeout(function(){ t.className = 'toast'; }, 5000);
+}
+
+async function refreshArchiveStatus() {
+  try {
+    var res = await fetch('/api/auto-archive/status', { headers: headers() });
+    if (!res.ok) return;
+    var data = await res.json();
+    document.getElementById('archive-status-last').textContent =
+      'Last check: ' + (data.last_check || 'never');
+    document.getElementById('archive-status-next').textContent =
+      'Next check: ' + (data.next_check || '—');
+    document.getElementById('archive-status-sheets').textContent =
+      'Sheets: ' + (data.sheets_monitored != null ? data.sheets_monitored : '—');
+    if (data.last_result) {
+      showArchiveToast('Last result: ' + data.last_result, 'success');
+    }
+  } catch (e) {
+    // Silently ignore — status is non-critical
+  }
+}
+
+async function saveArchiveSettings() {
+  var enabled = document.getElementById('cfg-archive-enabled').checked;
+  var maxRows = parseInt(document.getElementById('cfg-archive-max-rows').value.trim(), 10);
+  var interval = parseInt(document.getElementById('cfg-archive-interval').value.trim(), 10);
+
+  if (isNaN(maxRows) || maxRows < 1000 || maxRows > 1048575) {
+    showArchiveToast('Max rows must be between 1,000 and 1,048,575.', 'error');
+    return;
+  }
+  if (isNaN(interval) || interval < 1 || interval > 10080) {
+    showArchiveToast('Check interval must be between 1 and 10,080 minutes.', 'error');
+    return;
+  }
+
+  try {
+    var res = await fetch('/api/auto-archive/settings', {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({
+        enabled: enabled,
+        max_rows: maxRows,
+        check_interval_minutes: interval,
+      }),
+    });
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Save failed');
+
+    showArchiveToast('Auto-archive settings saved!', 'success');
+    refreshArchiveStatus();
+  } catch (e) {
+    showArchiveToast('Failed to save: ' + e.message, 'error');
+  }
+}
+
+async function checkNow() {
+  try {
+    var res = await fetch('/api/auto-archive/check', {
+      method: 'POST',
+      headers: headers(),
+    });
+    var data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Check failed');
+
+    showArchiveToast('Check completed: ' + (data.message || 'Done'), 'success');
+    refreshArchiveStatus();
+  } catch (e) {
+    showArchiveToast('Check failed: ' + e.message, 'error');
   }
 }
 </script>
@@ -1863,6 +2162,12 @@ if __name__ == "__main__":
     if args.register:
         _auto_register(args.register, args.name, args.location, args.office, args.main)
         print()
+
+    # --- Auto-archive monitor ---
+    from core.auto_archive import start_monitor, stop_monitor
+
+    if settings.AUTO_ARCHIVE_ENABLED:
+        start_monitor(settings)
 
     uvicorn.run(
         app,
