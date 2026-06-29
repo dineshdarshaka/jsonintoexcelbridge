@@ -5,9 +5,8 @@ from cryptography.fernet import Fernet
 lines = [
     f"API_KEY={secrets.token_hex(32)}",
     f"FERNET_KEY={Fernet.generate_key().decode()}",
-    "ALLOWED_ORIGINS=http://localhost:3000",
+    "ALLOWED_ORIGINS=http://localhost:3000,http://localhost:8000",
     "EXCEL_DIR=data",
-    "EXCEL_SHEET_NAME=Sheet1",
     "HOST=127.0.0.1",
     "PORT=8000",
 ]

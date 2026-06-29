@@ -288,7 +288,6 @@ async def root_page():
         bridge_url=f"http://{local_ip}:{settings.PORT}",
         data_root=str(settings.DATA_ROOT),
         data_structure=data_structure,
-        sheet_name=settings.EXCEL_SHEET_NAME,
         api_key=settings.API_KEY,
         fernet_key=settings.FERNET_KEY,
         bridge_id=settings.BRIDGE_ID,
@@ -329,7 +328,6 @@ async def machine_info() -> dict[str, Any]:
         },
         "config_summary": {
             "data_root": str(settings.DATA_ROOT),
-            "sheet_name": settings.EXCEL_SHEET_NAME,
             "api_key_fingerprint": settings.API_KEY[:8] + "..." + settings.API_KEY[-4:],
             "fernet_key_fingerprint": settings.FERNET_KEY[:8] + "...",
             "allowed_origins": settings.ALLOWED_ORIGINS,
@@ -359,7 +357,7 @@ async def get_data(office: str = "", sheet: str = "", location: str = "") -> Dat
     office_name = office.strip()
     location_name = location.strip()
     path: Path = settings.get_office_excel_path(office_name, location_name) if office_name else settings.DATA_ROOT / "data.xlsx"
-    sheet_name = sheet.strip() if sheet else settings.EXCEL_SHEET_NAME
+    sheet_name = sheet.strip() if sheet else "Sheet1"
 
     # Auto-create the workbook + sheet if it doesn't exist yet
     if not path.is_file():
@@ -468,7 +466,7 @@ async def update_data(payload: UpdatePayload) -> UpdateResponse:
     office_name = payload.office.strip()
     location_name = payload.location.strip()
     file_path: Path = settings.get_office_excel_path(office_name, location_name) if office_name else settings.DATA_ROOT / "data.xlsx"
-    target_sheet = payload.sheet_name.strip() if payload.sheet_name else settings.EXCEL_SHEET_NAME
+    target_sheet = payload.sheet_name.strip() if payload.sheet_name else "Sheet1"
 
     if not records:
         # Empty dataset = clear the sheet (keep the sheet, remove all rows)
@@ -570,7 +568,7 @@ async def execute_command(payload: CommandRequest, request: Request):
     """
     office_name = payload.office.strip()
     cmd_path: Path = settings.get_office_excel_path(office_name) if office_name else settings.DATA_ROOT / "data.xlsx"
-    cmd_sheet = payload.sheet_name.strip() if payload.sheet_name else settings.EXCEL_SHEET_NAME
+    cmd_sheet = payload.sheet_name.strip() if payload.sheet_name else "Sheet1"
 
     engine = CommandEngine(
         excel_path=cmd_path,
@@ -1609,14 +1607,6 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         </label>
       </div>
 
-      <!-- Sheet Name -->
-      <div class="form-group">
-        <label for="cfg-sheet">Sheet Name</label>
-        <input type="text" id="cfg-sheet" placeholder="Sheet1">
-      </div>
-
-      <hr class="divider">
-
       <!-- ===== AUTO-ARCHIVE SECTION ===== -->
       <div class="card-header" style="margin-top:0;margin-bottom:12px;">
         <h2 style="font-size:1.1rem;">&#128451;&#65039; Auto-Archive</h2>
@@ -1778,7 +1768,6 @@ function populateForm(cfg) {
   document.getElementById('cfg-fernet-key').value = cfg.FERNET_KEY || '';
   document.getElementById('cfg-origins').value = cfg.ALLOWED_ORIGINS || '';
   document.getElementById('cfg-excel-path').value = cfg.DATA_ROOT || '';
-  document.getElementById('cfg-sheet').value = cfg.EXCEL_SHEET_NAME || '';
   document.getElementById('cfg-host').value = cfg.HOST || '';
   document.getElementById('cfg-port').value = cfg.PORT || '';
 
@@ -1849,7 +1838,6 @@ async function saveConfig() {
     'FERNET_KEY':     document.getElementById('cfg-fernet-key').value.trim(),
     'ALLOWED_ORIGINS': document.getElementById('cfg-origins').value.trim(),
     'DATA_ROOT': document.getElementById('cfg-excel-path').value.trim(),
-    'EXCEL_SHEET_NAME': document.getElementById('cfg-sheet').value.trim(),
     'HOST':           document.getElementById('cfg-host').value.trim(),
     'PORT':           parseInt(document.getElementById('cfg-port').value.trim(), 10),
     'FRESH_DATA_FILE': document.getElementById('cfg-fresh-data').checked ? 'true' : 'false',

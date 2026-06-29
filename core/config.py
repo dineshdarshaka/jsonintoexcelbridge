@@ -121,9 +121,8 @@ if not ENV_PATH.is_file():
     _lines = [
         f"API_KEY={_secrets.token_hex(32)}",
         f"FERNET_KEY={Fernet.generate_key().decode()}",
-        "ALLOWED_ORIGINS=http://localhost:3000",
+        "ALLOWED_ORIGINS=http://localhost:3000,http://localhost:8000",
         f"DATA_ROOT={_data_root}",
-        "EXCEL_SHEET_NAME=Sheet1",
         "HOST=127.0.0.1",
         "PORT=8000",
         "AUTO_ARCHIVE_ENABLED=true",
@@ -182,7 +181,7 @@ class Settings:
     # -- CORS ---------------------------------------------------------------
     ALLOWED_ORIGINS: list[str] = [
         origin.strip()
-        for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+        for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
         if origin.strip()
     ]
 
@@ -199,8 +198,6 @@ class Settings:
         DATA_ROOT: Path = _raw_data_root.parent
     else:
         DATA_ROOT: Path = _raw_data_root
-
-    EXCEL_SHEET_NAME: str = os.getenv("EXCEL_SHEET_NAME", "Sheet1")
 
     # -- Auto-Archive Settings ------------------------------------------------
     # When enabled, the bridge periodically checks all sheets and auto-archives
@@ -325,7 +322,6 @@ def get_config_snapshot() -> dict[str, Any]:
         "FERNET_KEY_length": len(settings.FERNET_KEY),
         "ALLOWED_ORIGINS": _serialize_list(settings.ALLOWED_ORIGINS),
         "DATA_ROOT": str(settings.DATA_ROOT),
-        "EXCEL_SHEET_NAME": settings.EXCEL_SHEET_NAME,
         "HOST": settings.HOST,
         "PORT": settings.PORT,
         "BRIDGE_ID": settings.BRIDGE_ID,
@@ -354,7 +350,6 @@ def update_env_file(updates: dict[str, str | int]) -> dict[str, str]:
         "ALLOWED_ORIGINS",
         "DATA_ROOT",
         "EXCEL_DIR",
-        "EXCEL_SHEET_NAME",
         "HOST",
         "PORT",
         "BRIDGE_ID",
