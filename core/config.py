@@ -10,10 +10,12 @@ writes them back to the .env file on disk.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -286,15 +288,73 @@ def update_env_file(updates: dict[str, str | int]) -> dict[str, str]:
                 results[key] = "skipped — must be an integer"
                 continue
 
-        # python-dotenv's set_key wraps values in single quotes by default.
-        # Use quote_mode='never' to write bare values (e.g. true, not 'true').
-        set_key(str(ENV_PATH), key, value, quote_mode="never")
+        # python-dotenv's set_key. Use quote_mode='auto' — paths with spaces
+        # need quoting, but booleans like 'true' don't.
+        set_key(str(ENV_PATH), key, value, quote_mode="auto")
         results[key] = "updated"
 
     # Reload os.environ so future Settings reads see the new values
     load_dotenv(ENV_PATH, override=True)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Path-change log
+# ---------------------------------------------------------------------------
+LOG_FILE_PATH: Path = BASE_DIR / "path_change_log.json"
+
+
+def log_path_change(
+    old_path: str,
+    new_path: str,
+    action: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """
+    Append a change-log entry to the JSON log file.
+
+    Parameters
+    ----------
+    old_path : str
+        The previous Excel file path.
+    new_path : str
+        The new Excel file path.
+    action : str
+        One of 'move', 'fresh', or 'same' — describes what happened to the data.
+    extra : dict | None
+        Optional additional context (e.g. errors).
+    """
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "old_path": old_path,
+        "new_path": new_path,
+        "action": action,
+    }
+    if extra:
+        entry["extra"] = extra
+
+    # Load existing log (or start fresh)
+    log_entries: list[dict[str, Any]] = []
+    if LOG_FILE_PATH.is_file():
+        try:
+            log_entries = json.loads(LOG_FILE_PATH.read_text(encoding="utf-8"))
+            if not isinstance(log_entries, list):
+                log_entries = []
+        except Exception:
+            log_entries = []
+
+    log_entries.append(entry)
+
+    # Keep the log manageable — retain last 500 entries
+    if len(log_entries) > 500:
+        log_entries = log_entries[-500:]
+
+    LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOG_FILE_PATH.write_text(
+        json.dumps(log_entries, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 # ---------------------------------------------------------------------------

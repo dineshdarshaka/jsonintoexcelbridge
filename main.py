@@ -37,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
-from core.config import settings, get_config_snapshot, update_env_file, detect_safe_path
+from core.config import settings, get_config_snapshot, update_env_file, detect_safe_path, log_path_change
 from core.security import verify_api_key, decrypt_payload
 from core.command_engine import CommandEngine
 
@@ -370,6 +370,27 @@ async def get_data(sheet: str = "") -> DataResponse:
     )
 
 
+@app.get(
+    "/sheets",
+    dependencies=[Depends(require_auth)],
+)
+async def list_sheets() -> dict[str, Any]:
+    """
+    Return all sheet names from the Excel file.
+    """
+    path: Path = settings.EXCEL_FILE_PATH
+    if not path.is_file():
+        return {"sheets": []}
+    try:
+        xl = pd.ExcelFile(path)
+        return {"sheets": xl.sheet_names}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read Excel file: {exc!s}",
+        )
+
+
 @app.post(
     "/update",
     response_model=UpdateResponse,
@@ -550,7 +571,11 @@ async def update_config(payload: ConfigUpdatePayload) -> ConfigUpdateResult:
     Update configuration values and persist them to the .env file.
 
     If the Excel file path is changed, the existing data file is
-    **automatically moved** to the new location (preserving all sheets).
+    **automatically moved** to the new location (preserving all sheets)
+    unless the ``FRESH_DATA_FILE`` flag is set to ``"true"`` — in that
+    case a brand-new empty Excel file is created at the new path.
+
+    Every path change is recorded in ``path_change_log.json`` for audit.
 
     The server must be **restarted** for server-level settings
     (HOST, PORT, CORS) to take effect.  API_KEY and FERNET_KEY take
@@ -559,29 +584,100 @@ async def update_config(payload: ConfigUpdatePayload) -> ConfigUpdateResult:
     old_excel_path = settings.EXCEL_FILE_PATH
     new_excel_path_raw = payload.updates.get("EXCEL_FILE_PATH")
 
+    # ------------------------------------------------------------------
+    # Extract FRESH_DATA_FILE flag BEFORE passing to update_env_file
+    # (it's not an env var — just a runtime instruction)
+    # ------------------------------------------------------------------
+    fresh_data_file_raw = payload.updates.get("FRESH_DATA_FILE", "")
+    fresh_data_file = str(fresh_data_file_raw).strip().lower() in ("true", "1", "yes")
+
+    # Remove the flag so it doesn't get written to .env
+    payload.updates.pop("FRESH_DATA_FILE", None)
+
     results = update_env_file(payload.updates)
 
-    # --- Auto-move Excel file if path changed ---
+    # --- Auto-move / create Excel file if path changed ---
     if new_excel_path_raw:
         new_excel_path = Path(str(new_excel_path_raw).strip()).resolve()
 
-        # Only move if the path actually changed and the old file exists
-        if new_excel_path != old_excel_path.resolve() and old_excel_path.is_file():
+        # Only act if the path actually changed
+        if new_excel_path != old_excel_path.resolve():
             try:
                 # Ensure the target directory exists
                 new_excel_path.parent.mkdir(parents=True, exist_ok=True)
 
-                # Copy the old file to the new location
-                shutil.copy2(str(old_excel_path), str(new_excel_path))
-                results["EXCEL_FILE_MOVED"] = (
-                    f"Data copied from '{old_excel_path}' → '{new_excel_path}'."
-                    f" You may delete the old file manually if desired."
-                )
+                if fresh_data_file:
+                    # ------------------------------------------------------------------
+                    # FRESH — create a new empty Excel file with default headers
+                    # ------------------------------------------------------------------
+                    import openpyxl
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = settings.EXCEL_SHEET_NAME
+                    # Write default headers
+                    headers = ["Date & Time", "Barcode", "Action"]
+                    for col_idx, header in enumerate(headers, 1):
+                        ws.cell(row=1, column=col_idx, value=header)
+                    wb.save(str(new_excel_path))
+                    wb.close()
+
+                    results["EXCEL_FILE_MOVED"] = (
+                        f"Fresh empty data file created at '{new_excel_path}'. "
+                        f"Old file left untouched at '{old_excel_path}'."
+                    )
+                    log_path_change(
+                        str(old_excel_path),
+                        str(new_excel_path),
+                        "fresh",
+                    )
+                elif old_excel_path.is_file():
+                    # ------------------------------------------------------------------
+                    # MOVE — copy existing data to new location
+                    # ------------------------------------------------------------------
+                    shutil.copy2(str(old_excel_path), str(new_excel_path))
+                    results["EXCEL_FILE_MOVED"] = (
+                        f"Data copied from '{old_excel_path}' → '{new_excel_path}'."
+                        f" You may delete the old file manually if desired."
+                    )
+                    log_path_change(
+                        str(old_excel_path),
+                        str(new_excel_path),
+                        "move",
+                    )
+                else:
+                    # ------------------------------------------------------------------
+                    # Old file doesn't exist — create a fresh one at the new path
+                    # ------------------------------------------------------------------
+                    import openpyxl
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = settings.EXCEL_SHEET_NAME
+                    headers = ["Date & Time", "Barcode", "Action"]
+                    for col_idx, header in enumerate(headers, 1):
+                        ws.cell(row=1, column=col_idx, value=header)
+                    wb.save(str(new_excel_path))
+                    wb.close()
+
+                    results["EXCEL_FILE_MOVED"] = (
+                        f"New data file created at '{new_excel_path}' "
+                        f"(old file did not exist at '{old_excel_path}')."
+                    )
+                    log_path_change(
+                        str(old_excel_path),
+                        str(new_excel_path),
+                        "fresh",
+                    )
             except Exception as exc:
                 results["EXCEL_FILE_MOVED"] = (
                     f"WARNING: Could not copy data to new location: {exc}. "
                     f"Old file still at '{old_excel_path}'. "
                     f"Please manually copy it to '{new_excel_path}'."
+                )
+                log_path_change(
+                    str(old_excel_path),
+                    str(new_excel_path),
+                    "move",
+                    extra={"error": str(exc)},
                 )
 
     return ConfigUpdateResult(
@@ -1295,6 +1391,10 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         <p style="font-size:.7rem;color:var(--sub);margin-top:4px;" id="excel-path-hint">
           Store data on a non-system drive to keep it safe if Windows is reformatted.
         </p>
+        <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer; font-weight:400; margin-top:8px; font-size:.8rem; color:var(--sub);">
+          <input type="checkbox" id="cfg-fresh-data" style="width:auto; margin:0; accent-color:var(--accent);">
+          ✨ Start with a fresh data file (don't copy existing data to new location)
+        </label>
       </div>
 
       <!-- Sheet Name -->
@@ -1471,6 +1571,7 @@ async function saveConfig() {
     'EXCEL_SHEET_NAME': document.getElementById('cfg-sheet').value.trim(),
     'HOST':           document.getElementById('cfg-host').value.trim(),
     'PORT':           parseInt(document.getElementById('cfg-port').value.trim(), 10),
+    'FRESH_DATA_FILE': document.getElementById('cfg-fresh-data').checked ? 'true' : 'false',
   };
 
   // Filter out empty / masked-only values (user didn't change them)
