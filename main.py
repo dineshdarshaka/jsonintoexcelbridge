@@ -1110,10 +1110,6 @@ _ROOT_HTML = """<!DOCTYPE html>
                 <div class="value" style="font-size:0.75rem;">{data_structure}</div>
             </div>
             <div class="info-item">
-                <div class="label">Sheet Name</div>
-                <div class="value">{sheet_name}</div>
-            </div>
-            <div class="info-item">
                 <div class="label">Bridge ID</div>
                 <div class="value" style="font-family:monospace; font-size:0.8rem; word-break:break-all;">{bridge_id}</div>
             </div>
